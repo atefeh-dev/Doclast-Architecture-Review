@@ -1,201 +1,232 @@
-bash
+# Doclast Backend Architecture Report
 
-# Doclast — Backend Architecture Report
+### Document Lifecycle Management — Engineering Design for CTO Review
 
-## Document Lifecycle Management: Design Recommendations for CTO Review
-
-**Version:** 2.0  
+**Version:** 3.0  
 **Date:** June 2026  
-**Prepared by:** Engineering Review  
-**Based on:** SidebarVulcan analysis + Doclast product requirements
+**Status:** Final
 
 ---
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [What We Learned from Sidebar](#2-what-we-learned-from-sidebar)
-3. [Database Schema Recommendations](#3-database-schema-recommendations)
-4. [Lifecycle State Design](#4-lifecycle-state-design)
-5. [Event-Driven Architecture](#5-event-driven-architecture)
-6. [Email Automation System](#6-email-automation-system)
-7. [Workflow Automation and Scheduled Jobs](#7-workflow-automation-and-scheduled-jobs)
-8. [Audit Trail and Compliance](#8-audit-trail-and-compliance)
-9. [Missing Components and Services](#9-missing-components-and-services)
-10. [Scalability Considerations](#10-scalability-considerations)
-11. [Architecture Diagrams](#11-architecture-diagrams)
-12. [Implementation Roadmap](#12-implementation-roadmap)
-13. [What Not to Build](#13-what-not-to-build)
+2. [Lessons from SidebarVulcan](#2-lessons-from-sidebarvulcan)
+3. [Core Architecture Principles](#3-core-architecture-principles)
+4. [Database Schema](#4-database-schema)
+5. [Lifecycle State Machine](#5-lifecycle-state-machine)
+6. [Event-Driven Architecture](#6-event-driven-architecture)
+7. [Email Automation](#7-email-automation)
+8. [Scheduled Jobs and Workflow Automation](#8-scheduled-jobs-and-workflow-automation)
+9. [Audit Trail and Legal Compliance](#9-audit-trail-and-legal-compliance)
+10. [Missing Services and Gaps](#10-missing-services-and-gaps)
+11. [Scalability and Multi-Tenancy](#11-scalability-and-multi-tenancy)
+12. [System Architecture Diagrams](#12-system-architecture-diagrams)
+13. [Implementation Roadmap](#13-implementation-roadmap)
+14. [What Not to Build](#14-what-not-to-build)
+15. [Appendix](#15-appendix)
 
 ---
 
 ## 1. Executive Summary
 
-Doclast's core product — generate → send → review → approve → sign — is a document lifecycle system. The database schema, event architecture, and automation layer must be designed around that lifecycle from the start, not retrofitted once the product grows.
+Doclast's product is a **document lifecycle system**. Every engineering decision should flow from that fact. The generate → send → review → approve → sign workflow is not a feature sitting on top of an application — it _is_ the application. Every layer of the backend (schema, events, automation, emails) must be designed around this lifecycle from the start.
 
-SidebarVulcan demonstrates what this looks like at production scale for a simpler object (a blog post). Its patterns translate almost directly to Doclast's more complex document workflow, with three additions Sidebar doesn't need: cryptographic signature verification, a tamper-evident audit trail for legal compliance, and multi-party signing flows.
+SidebarVulcan, a production newsletter platform by Sacha Greif, demonstrates exactly this pattern at scale — organized around a single central object (`Post`) moving through a defined lifecycle. Its architecture translates directly to Doclast, with three additions Sidebar doesn't require: cryptographic signature verification, a tamper-evident compliance trail, and sequential multi-party signing.
 
-The five decisions that will most affect Doclast's architecture at scale:
+### Five Decisions That Define the Architecture
 
-1. **Store lifecycle timestamps as first-class schema fields**, not derived from an event log or computed from status history.
-2. **Route all state transitions through a single `DocumentService.transition()` function** — no exceptions, no bypasses.
-3. **Use an append-only event log as the authoritative audit trail**, separate from the mutable document record.
-4. **Keep document generation (PDF/DOCX rendering) behind a queue**, not in the request path.
-5. **Design the signature model to be verifiable without Doclast's servers** — users must be able to validate a signed document independently.
+These are architectural commitments, not implementation choices. Getting them wrong early is expensive to correct later.
+
+| #   | Decision                                                                             | Why It Matters                                                                                            |
+| --- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| 1   | Store lifecycle timestamps as first-class schema fields                              | Enables time-aware queries, analytics, reminders, and compliance without reconstructing history           |
+| 2   | Route all state transitions through a single `DocumentService.transition()` function | Prevents state drift, enforces business rules, and guarantees the audit log is always complete            |
+| 3   | Maintain an append-only event log separate from the mutable document record          | The event log is legal evidence; the document record is operational state — they serve different purposes |
+| 4   | Run document generation (PDF/DOCX rendering) behind a job queue                      | Rendering is CPU-bound; it cannot share a process with HTTP request handling at any meaningful scale      |
+| 5   | Design signatures to be verifiable without Doclast's servers                         | A signed contract must remain provable even if Doclast is unavailable or the customer leaves the platform |
 
 ---
 
-## 2. What We Learned from Sidebar
+## 2. Lessons from SidebarVulcan
 
 ### 2.1 The Central Insight
 
-Sidebar organizes every layer of its system around a single question: _where is this object in its lifecycle?_ The schema, callbacks, emails, and cron jobs are all answers to sub-questions of that question.
+Sidebar organizes every layer of its system around one question: _where is this object in its lifecycle?_ The schema answers it with timestamps. The callbacks react to lifecycle transitions. The emails communicate them to stakeholders. The cron layer advances the lifecycle when no user action has occurred.
 
-For Doclast this means: every engineering decision should start with the document lifecycle, not with the database table or the API endpoint.
+For Doclast, the equivalent question is: _where is this document in its journey from draft to signed?_
 
-### 2.2 Directly Transferable Patterns
+### 2.2 Patterns Worth Adopting Directly
 
-**Lifecycle timestamps on the schema**  
-Sidebar stores `scheduledAt`, `postedAt`, `paidAt` alongside `status`. This is not redundancy — `status` tells you the current state, timestamps tell you the history. Both are needed. Sidebar's approach eliminates the need to reconstruct history from an event log for common queries, while still allowing an event log for compliance.
+**Lifecycle timestamps alongside status**  
+Sidebar stores `scheduledAt`, `postedAt`, and `paidAt` as explicit fields, not derived values. This is deliberate design: `status` tells you _where_ the object is now; timestamps tell you _when it got there and how long it has been there_. Both dimensions are required for reminders, expiry enforcement, SLA tracking, and legal evidence. Doclast needs the same discipline.
 
 **Declarative email registry**  
-Each email in Sidebar is a self-contained object that declares its own data requirements. The caller provides only the document ID and the email key. This decouples trigger logic from rendering logic and makes the full email surface of the system discoverable from a single file.
+In Sidebar, each email is a self-contained object specifying its template, subject line, recipient resolution, and data requirements. The caller provides only the document ID and the email key — it never prepares data or constructs subjects. This design makes the full set of system emails discoverable from a single file and makes each email independently testable. It is the most directly portable pattern in the codebase.
 
-**Dedicated cron layer**  
-Sidebar's scheduler runs independently of the mutation layer. Scheduled work (reminders, expiry) has its own code path, its own error handling, and its own observability. This is the correct separation: time-based triggers and user-triggered mutations should never share implementation code.
+**Isolated cron layer**  
+Sidebar's scheduled work lives in a dedicated file with its own error handling and observability, completely separate from mutation logic. Time-based triggers (reminders, expiry enforcement) and user-triggered mutations are different code paths. They must never share implementation, because they have different failure modes, different retry semantics, and different observability requirements.
 
 **Named callbacks on business events**  
-Sidebar registers callbacks per mutation type. Doclast should register them per business event. The event name carries intent (`document.signed`) that a CRUD operation name (`documents.update.after`) does not.
+Sidebar registers callbacks per CRUD operation (`posts.new.after`). Doclast should register them per _business event_ (`document.signed`). The event name carries intent that a database operation name does not, and it decouples the business logic layer from the persistence layer.
 
-### 2.3 Patterns to Improve On
+### 2.3 Anti-Patterns to Avoid
 
-**Magic strings in callbacks**  
-Sidebar's callbacks check `context.event === 'some-string'` internally. This creates silent coupling that TypeScript cannot catch. Doclast should use a typed event union from day one.
+**Magic strings in callback context**  
+Sidebar's callbacks check `context.event === 'some-string'` internally. This creates invisible coupling that TypeScript cannot catch at compile time and that tests will not surface until production. Doclast must use a typed event union enforced from day one.
 
-**No multi-party model**  
-Sidebar emails go to one recipient. Doclast needs a signing model that supports multiple signers in a defined sequence, each with their own status, timestamp, and reminder chain.
+**Single-recipient email model**  
+Sidebar emails go to one person. Doclast needs sequential multi-party signing where each signer has their own notification chain, reminder schedule, and per-signer audit record. This cannot be retrofitted onto a single-signer model.
 
-**No document storage abstraction**  
-Sidebar stores content in MongoDB. Doclast's documents are generated files — they need a storage model that supports multiple backends (Drive, Dropbox, Box) without the lifecycle logic knowing which backend is active.
+**Coupled storage**  
+Sidebar stores content directly in its application database. Doclast generates files that must be saved to customer-controlled storage (Drive, Dropbox, Box). The lifecycle layer must be agnostic to which provider is active — storage is a plugin, not a dependency.
 
 ---
 
-## 3. Database Schema Recommendations
+## 3. Core Architecture Principles
 
-### 3.1 The Document Table
+These principles govern every design decision in this report. When a specific implementation question arises, these are the tie-breakers.
 
-The document record is the mutable source of truth for current state. It is not the audit trail.
+**1. The document lifecycle is the system.**  
+Every service, table, and callback exists to serve the document's journey from draft to signed. If a component cannot be explained in terms of its role in that journey, it does not belong in the core architecture.
+
+**2. One transition function. No exceptions.**  
+All state changes — whether triggered by an API call, a cron job, a webhook, or an admin command — pass through `DocumentService.transition()`. There is no valid shortcut. Any bypass is a bug, even if it is convenient.
+
+**3. Status and timestamp are a pair.**  
+Every time `status` changes, its corresponding timestamp is written in the same database transaction. They are never updated independently. Violating this invariant corrupts the audit trail and breaks time-aware features.
+
+**4. Callbacks are side effects, not state managers.**  
+A callback reacts to a lifecycle event. It sends an email, saves a file, or appends a metric. It does not own state transitions. If a callback needs to change document state, it calls `DocumentService.transition()` — it does not write to the database directly.
+
+**5. The audit log is immutable.**  
+The `document_events` table is append-only at the database level. No application code, no migration script, and no administrative tool may update or delete rows from it. Its integrity is what makes it legally defensible.
+
+**6. Design for independent verifiability.**  
+Every signed document must carry enough information for any party — including a court — to verify the signature without trusting or contacting Doclast. The signature hash is self-contained evidence.
+
+---
+
+## 4. Database Schema
+
+### 4.1 The Documents Table
+
+The `documents` table is the mutable operational record. It holds current state and the full lifecycle timestamp history. It is not the audit trail — that is the `document_events` table.
 
 ```ts
-// documents table
 interface Document {
   // ── Identity ────────────────────────────────────────────────────────────
   id: string; // UUID v4
   ownerId: string; // FK → users.id
-  workspaceId: string; // FK → workspaces.id (for team plans)
+  workspaceId: string; // FK → workspaces.id (required from day one — see §11.3)
   title: string;
   templateId: TemplateId; // 'NDA' | 'collaboration' | 'MOU' | custom
 
-  // ── Current lifecycle state ──────────────────────────────────────────────
+  // ── Lifecycle ───────────────────────────────────────────────────────────
+  // Invariant: status and its corresponding timestamp are always written together.
+  // Invariant: timestamps are never overwritten. Re-sends use resentAt, not sentAt.
   status: DocumentStatus;
-
-  // ── Lifecycle timestamps ─────────────────────────────────────────────────
-  // Rule: always updated atomically with status.
-  // Rule: never overwritten — use separate fields for re-sends.
   createdAt: Date;
   sentAt: Date | null;
-  firstViewedAt: Date | null; // when the signer first opened the link
+  firstViewedAt: Date | null;
   reviewingAt: Date | null;
   approvedAt: Date | null;
   signedAt: Date | null;
   expiredAt: Date | null;
   revokedAt: Date | null;
-  resentAt: Date | null; // if owner re-sent — does NOT overwrite sentAt
+  resentAt: Date | null; // populated on resend; sentAt is preserved
 
-  // ── Expiry configuration ─────────────────────────────────────────────────
+  // ── Expiry and reminders ─────────────────────────────────────────────────
   expiresAt: Date | null; // deadline set by owner at creation
-  reminderSentAt: Date | null; // tracks last reminder to avoid duplicates
+  expiryWarnedAt: Date | null; // set when 48h warning email is sent
+  reminderSentAt: Date | null; // updated on each reminder send
 
-  // ── Document fields (filled form data) ──────────────────────────────────
-  fields: Record<string, string>;
+  // ── Form data ────────────────────────────────────────────────────────────
+  fields: Record<string, string>; // template-specific field values
 
   // ── Storage ──────────────────────────────────────────────────────────────
-  // The generated file is stored externally. This record tracks where.
-  storageProvider: StorageProvider | null; // 'drive' | 'dropbox' | 'box' | 'internal'
+  // The generated file lives in the owner's connected storage, not on Doclast servers.
+  storageProvider: "drive" | "dropbox" | "box" | "internal" | null;
   storagePath: string | null;
   storageFileId: string | null;
 
   // ── Signature ────────────────────────────────────────────────────────────
-  signatureHash: string | null; // SHA-256 of document content + signerEmail + signedAt
+  signatureHash: string | null; // SHA-256(documentBytes + signerEmail + signedAt + documentId)
   signatureMethod: "otp_email" | "docusign" | null;
 
-  // ── Metadata ─────────────────────────────────────────────────────────────
+  // ── Schema versioning ────────────────────────────────────────────────────
+  schemaVersion: number; // incremented on breaking schema changes
   updatedAt: Date;
-  schemaVersion: number; // for schema migration safety
 }
 
 type DocumentStatus =
-  | "draft" // fields being filled, not yet sent
-  | "sent" // email delivered to signer
-  | "viewed" // signer opened the link
-  | "reviewing" // signer is actively reviewing
-  | "approved" // signer accepted, pending signature
-  | "signed" // signature verified and stored
-  | "expired" // expiresAt passed before signing
-  | "revoked"; // owner cancelled before signing
+  | "draft" // fields being filled; not yet sent
+  | "sent" // email dispatched to signer(s)
+  | "viewed" // at least one signer has opened the signing link
+  | "reviewing" // signer is actively reading the document
+  | "approved" // signer has accepted; awaiting signature
+  | "signed" // all signers have signed; terminal
+  | "expired" // expiresAt passed before completion; terminal
+  | "revoked"; // owner cancelled; terminal
 ```
 
-### 3.2 The Signers Table
+### 4.2 The Document Signers Table
 
-The current schema treats a document as having one signer. This breaks the moment a customer asks for multi-party signing (NDA between three parties, employment contract requiring HR + candidate + legal). Design for it now.
+Treating a document as having a single signer breaks the moment a customer requests multi-party signing. This is not a V2 concern — it affects the schema, the event model, and the reminder system. Design for it now.
 
 ```ts
-// document_signers table
 interface DocumentSigner {
   id: string;
   documentId: string; // FK → documents.id
   email: string;
   name: string | null;
-  role: string | null; // 'party_a', 'party_b', 'witness', etc.
-  order: number; // signing sequence (1 = first, 2 = second, ...)
+  role: string | null; // 'party_a' | 'party_b' | 'witness' | etc.
+
+  // Signing order: signer with order 2 is not notified until all order-1 signers have signed.
+  // Signers with the same order value sign in parallel.
+  signingOrder: number;
+
   status: SignerStatus;
 
-  // Per-signer lifecycle timestamps
-  notifiedAt: Date | null; // when their signing email was sent
+  // Per-signer lifecycle timestamps — mirror the document-level pattern
+  notifiedAt: Date | null;
   viewedAt: Date | null;
   signedAt: Date | null;
+  declinedAt: Date | null;
   reminderSentAt: Date | null;
 
-  // Per-signer signature data
+  // Per-signer signature evidence
   signatureHash: string | null;
-  ipAddress: string | null; // for legal audit trail
+  ipAddress: string | null; // collected at signing time for audit trail
   userAgent: string | null;
 }
 
 type SignerStatus = "pending" | "notified" | "viewed" | "signed" | "declined";
 ```
 
-**Signing sequence rule:** A signer with `order: 2` should not be notified until all signers with `order: 1` have status `signed`. The cron job handles this check — not the document mutation handler.
+### 4.3 The Document Events Table
 
-### 3.3 The Document Events Table (Append-Only Audit Log)
-
-This is a separate table from the document record. It is never updated and never deleted. It is the legal source of truth.
+This table is the legal source of truth. It records everything that happens to a document, in order, with a tamper-evident integrity chain. It is never updated and never deleted.
 
 ```ts
-// document_events table
 interface DocumentEvent {
-  id: string;
+  id: string; // UUID v4
   documentId: string; // FK → documents.id
-  event: DocumentEventType;
-  actorType: "user" | "signer" | "system" | "cron";
-  actorId: string | null; // userId, signerEmail, 'system', or cronJobName
-  occurredAt: Date;
-  metadata: Record<string, unknown>; // event-specific data (IP, user agent, etc.)
 
-  // Integrity
-  // Each event includes a hash of (previousEventId + eventData).
-  // This creates a tamper-evident chain — any modification of a past event
-  // breaks the hash of every subsequent event.
+  event: DocumentEventType;
+
+  // Who caused this event
+  actorType: "user" | "signer" | "system" | "cron";
+  actorId: string | null; // user ID, signer email, job name, or null for system
+
+  occurredAt: Date;
+
+  // Structured event-specific data (IP address, user agent, template version, etc.)
+  metadata: Record<string, unknown>;
+
+  // Tamper-evident integrity chain.
+  // integrityHash = SHA-256(previousEvent.integrityHash + eventType + actorId + occurredAt + metadata)
+  // Any modification to a past event invalidates all subsequent hashes.
   previousEventId: string | null;
   integrityHash: string;
 }
@@ -213,6 +244,7 @@ type DocumentEventType =
   | "document.expired"
   | "document.revoked"
   | "document.reminder_sent"
+  | "document.expiry_warning_sent"
   | "document.storage_saved"
   | "signer.added"
   | "signer.notified"
@@ -221,89 +253,107 @@ type DocumentEventType =
   | "signer.declined";
 ```
 
-### 3.4 Indexing Strategy
+### 4.4 Index Strategy
+
+Indexes are not an afterthought. The cron jobs and dashboard queries that run most frequently need covering indexes defined from the first migration.
 
 ```sql
--- Core queries every request will hit
-CREATE INDEX idx_documents_owner    ON documents(owner_id, status, created_at DESC);
-CREATE INDEX idx_documents_status   ON documents(status, expires_at) WHERE status IN ('sent', 'viewing', 'reviewing');
+-- Dashboard queries: owner views their document list
+CREATE INDEX idx_documents_owner
+  ON documents (owner_id, status, created_at DESC);
 
--- Cron job queries (time-based scans)
-CREATE INDEX idx_documents_expiry   ON documents(expires_at) WHERE status NOT IN ('signed', 'expired', 'revoked');
-CREATE INDEX idx_documents_reminder ON documents(sent_at, reminder_sent_at) WHERE status = 'sent';
+-- Partial index for active documents only — keeps it small
+CREATE INDEX idx_documents_active_expiry
+  ON documents (expires_at)
+  WHERE status NOT IN ('signed', 'expired', 'revoked');
 
--- Audit log queries
-CREATE INDEX idx_events_document    ON document_events(document_id, occurred_at DESC);
-CREATE INDEX idx_events_integrity   ON document_events(previous_event_id);
+-- Cron: find documents due for signature reminders
+CREATE INDEX idx_documents_reminder
+  ON documents (sent_at, reminder_sent_at)
+  WHERE status IN ('sent', 'viewed');
 
--- Signer queries
-CREATE INDEX idx_signers_document   ON document_signers(document_id, "order");
-CREATE INDEX idx_signers_email      ON document_signers(email, status);
+-- Audit log: reconstruct history for a given document
+CREATE INDEX idx_events_document
+  ON document_events (document_id, occurred_at DESC);
+
+-- Audit log: verify integrity chain
+CREATE INDEX idx_events_chain
+  ON document_events (previous_event_id);
+
+-- Signer queries: find signers for a document in signing order
+CREATE INDEX idx_signers_document_order
+  ON document_signers (document_id, signing_order);
+
+-- Cron: find signers due for reminders
+CREATE INDEX idx_signers_reminder
+  ON document_signers (status, notified_at)
+  WHERE status IN ('notified', 'viewed');
 ```
 
 ---
 
-## 4. Lifecycle State Design
+## 5. Lifecycle State Machine
 
-### 4.1 Valid Transitions
+### 5.1 Valid Transitions
 
-Not every state can transition to every other state. Encoding valid transitions explicitly prevents bugs that are otherwise invisible until production.
+Encoding valid transitions as an explicit map eliminates an entire class of bugs. An invalid transition attempt becomes a loud, immediate error — not a silent data corruption.
 
 ```ts
+// The complete set of valid lifecycle transitions.
+// Terminal states (signed, expired, revoked) have empty arrays — no exits.
 const VALID_TRANSITIONS: Record<DocumentStatus, DocumentStatus[]> = {
   draft: ["sent", "revoked"],
-  sent: ["viewed", "expired", "revoked", "sent"], // 'sent' allows resend
+  sent: ["viewed", "expired", "revoked", "sent"], // 'sent' → 'sent' permits resend
   viewed: ["reviewing", "expired", "revoked"],
   reviewing: ["approved", "expired", "revoked"],
   approved: ["signed", "expired", "revoked"],
-  signed: [], // terminal — no transitions out
-  expired: [], // terminal
-  revoked: [], // terminal
+  signed: [],
+  expired: [],
+  revoked: [],
 };
 
-function assertValidTransition(from: DocumentStatus, to: DocumentStatus): void {
-  if (!VALID_TRANSITIONS[from].includes(to)) {
-    throw new InvalidTransitionError(
-      `Cannot transition document from '${from}' to '${to}'`,
-    );
+class InvalidTransitionError extends Error {
+  constructor(from: DocumentStatus, to: DocumentStatus) {
+    super(`Cannot transition document from '${from}' to '${to}'`);
+    this.name = "InvalidTransitionError";
   }
 }
 ```
 
-### 4.2 The Single Transition Function
+### 5.2 The Transition Function
 
-All state changes — from API handlers, cron jobs, webhooks, admin tools — must pass through this function. There is no valid reason to bypass it.
+Every state change in the system — from API handlers, cron jobs, webhooks, and admin tooling — passes through this function without exception. It is the system's single point of truth for lifecycle management.
 
 ```ts
 // document-service.ts
+
 async function transition(
   documentId: string,
   event: DocumentEventType,
   actor: EventActor,
   metadata: Record<string, unknown> = {},
 ): Promise<Document> {
-  return await db.transaction(async (tx) => {
-    // 1. Load current document with a row-level lock
+  // All writes are atomic: status, timestamp, and audit event commit together
+  // or not at all. A partial write is worse than no write.
+  const updatedDocument = await db.transaction(async (tx) => {
+    // SELECT FOR UPDATE prevents concurrent transitions on the same document.
     const doc = await tx.documents.findByIdForUpdate(documentId);
 
-    // 2. Derive the target status from the event type
     const targetStatus = eventToStatus(event);
-
-    // 3. Validate the transition before touching anything
     assertValidTransition(doc.status, targetStatus);
 
-    // 4. Prepare the update atomically: status + timestamp + updatedAt
-    const timestamp = timestampFieldForStatus(targetStatus);
     const now = new Date();
+    const tsField = statusTimestampField(targetStatus); // e.g. 'signedAt' for 'signed'
 
-    const updatedDoc = await tx.documents.update(documentId, {
+    const updated = await tx.documents.update(documentId, {
       status: targetStatus,
-      [timestamp]: now,
+      [tsField]: now,
       updatedAt: now,
     });
 
-    // 5. Append an immutable event to the audit log
-    await appendEvent(tx, {
+    // The event is appended inside the same transaction.
+    // If the document update fails, no event is recorded — the log stays consistent.
+    await appendAuditEvent(tx, {
       documentId,
       event,
       actor,
@@ -311,70 +361,76 @@ async function transition(
       metadata,
     });
 
-    // 6. Run registered callbacks (outside the DB transaction — see note below)
-    await runCallbacks(event, updatedDoc, actor);
-
-    return updatedDoc;
+    return updated;
   });
+
+  // Callbacks execute after the transaction commits.
+  // Rationale: a transaction holding a DB lock while awaiting an external HTTP call
+  // (email send, storage upload) creates deadlock risk under load. The document
+  // state is already committed; a callback failure should trigger a retry, not
+  // a rollback. Callbacks are side effects — they do not own state.
+  await runCallbacks(event, updatedDocument, actor);
+
+  return updatedDocument;
 }
 ```
 
-> **Note on callbacks and transactions:** Callbacks that send emails or call external APIs must run _after_ the transaction commits, not inside it. A transaction that holds a DB lock while waiting for an external HTTP call is a deadlock waiting to happen. The pattern: commit the transaction, then run callbacks. If a callback fails, log and retry — do not roll back the document state.
-
-### 4.3 Transition Map (Text Diagram)
+### 5.3 State Transition Map
 
 ```
-                        ┌─────────────────────────────┐
-                        │          DOCUMENT            │
-                        └─────────────────────────────┘
-                                      │
-                              [owner fills form]
-                                      │
-                                  ┌───▼───┐
-                            ┌────►│ draft │◄─────────────────────┐
-                            │     └───┬───┘                      │
-                       [resend]   [owner sends]             [re-draft? future]
-                            │         │
-                        ┌───┴───┐   ┌─▼────┐
-                        │       │   │ sent │──────────────────────────────┐
-                        │       │   └──┬───┘                              │
-                        │       │ [signer opens link]                     │
-                        │       │      │                                  │
-                        │       │  ┌───▼────┐                             │
-                        │       │  │ viewed │                             │
-                        │       │  └───┬────┘                             │
-                        │       │ [starts reading]                        │
-                        │       │      │                              [expires_at
-                        │       │ ┌────▼──────┐                       reached]
-                        │       │ │ reviewing │                           │
-                        │       │ └────┬──────┘                          │
-                        │       │ [accepts]                               │
-                        │       │      │                                  │
-                        │       │ ┌────▼────┐                             │
-                        │       │ │approved │                             │
-                        │       │ └────┬────┘                             │
-                        │       │ [signs]                                 │
-                        │       │      │                                  │
-                        │       │ ┌────▼────┐                          ┌──▼──────┐
-                        │       │ │ signed  │ ← terminal               │ expired │ ← terminal
-                        │       │ └─────────┘                          └─────────┘
-                        │       │
-                    ┌───┴───────┴──┐
-                    │   revoked    │ ← terminal (owner action from any non-terminal state)
-                    └──────────────┘
+                          ┌──────────┐
+                          │  draft   │ ◄─── owner fills form
+                          └────┬─────┘
+                               │ owner clicks Send
+                               ▼
+                          ┌──────────┐
+                    ┌────►│   sent   │◄──── resend (sentAt preserved, resentAt set)
+                    │     └────┬─────┘
+                 [resend]      │ signer opens link
+                    │          ▼
+                    │     ┌──────────┐
+                    │     │  viewed  │
+                    │     └────┬─────┘
+                    │          │ signer begins reading
+                    │          ▼
+                    │     ┌──────────────┐
+                    │     │  reviewing   │
+                    │     └────┬─────────┘
+                    │          │ signer accepts changes
+                    │          ▼
+                    │     ┌──────────┐
+                    │     │ approved │
+                    │     └────┬─────┘
+                    │          │ signer signs
+                    │          ▼
+                    │     ┌──────────┐
+                    │     │  signed  │ ◄─── terminal
+                    │     └──────────┘
+                    │
+                    │  From any non-terminal state:
+                    │
+                    ├──────────────────────► expired  ◄─── cron: expiresAt passed
+                    │                        (terminal)
+                    │
+                    └──────────────────────► revoked  ◄─── owner action
+                                             (terminal)
 ```
 
 ---
 
-## 5. Event-Driven Architecture
+## 6. Event-Driven Architecture
 
-### 5.1 The Event Bus
+### 6.1 The Event Bus Interface
 
-Doclast needs a lightweight internal event bus. For early stage, a simple in-process emitter is sufficient. It must be replaceable with a proper message queue (BullMQ, Redis Streams) without changing the callback signatures.
+The event bus is intentionally defined as an interface, not an implementation. In early development, an in-process synchronous emitter is sufficient and easier to debug. As volume grows, the same interface is satisfied by a BullMQ-backed async queue — no call sites change.
 
 ```ts
 // events/bus.ts
-type EventHandler<T = unknown> = (payload: T, meta: EventMeta) => Promise<void>;
+
+type EventHandler = (
+  payload: DocumentEventPayload,
+  meta: EventMeta,
+) => Promise<void>;
 
 interface EventBus {
   emit(event: DocumentEventType, payload: DocumentEventPayload): Promise<void>;
@@ -382,48 +438,51 @@ interface EventBus {
   off(event: DocumentEventType, handler: EventHandler): void;
 }
 
-// In development / early production: synchronous in-process emitter
-// In production at scale: swap the implementation to BullMQ without
-// changing any call sites — the interface stays identical.
+// Swap implementation without touching any call site:
+// Development:  new InProcessEventBus()
+// Production:   new BullMQEventBus(redisConnection)
 ```
 
-### 5.2 Callback Registration
+### 6.2 The Callback Registry
+
+The callback registry is the single most important file for a new engineer joining the team. It answers the question: _what does the system do when this event occurs?_ Every side effect is visible here. Nothing is hidden in database triggers, middleware, or scattered service calls.
 
 ```ts
 // callbacks/index.ts
-// This file is the complete registry of all business logic in the system.
-// A new engineer can read this file and understand every side effect
-// that any document event triggers. Nothing is hidden.
+// Complete registry of all business logic side effects.
+// Every event → handler relationship in the system is declared here.
 
 bus.on("document.sent", triggerDocumentSentEmail);
 bus.on("document.sent", startSignerReminderTracking);
 bus.on("document.viewed", stampFirstViewedAt);
 bus.on("document.signed", verifyAndStoreSignatureHash);
 bus.on("document.signed", triggerDocumentSignedEmail);
-bus.on("document.signed", saveToConnectedStorage);
+bus.on("document.signed", saveDocumentToStorage);
 bus.on("document.expired", triggerDocumentExpiredEmail);
-bus.on("document.expired", blockSigningLink);
+bus.on("document.expired", invalidateSigningLinks);
 bus.on("document.revoked", triggerDocumentRevokedEmail);
-bus.on("document.revoked", blockSigningLink);
+bus.on("document.revoked", invalidateSigningLinks);
 ```
 
-### 5.3 Callback Design Rules
+### 6.3 Callback Design Contracts
 
-Each callback must follow four rules without exception:
+Every callback is a named, exported, independently testable function. It must satisfy four contracts:
 
-**Rule 1: Single responsibility.** `triggerDocumentSentEmail` triggers an email and does nothing else. It does not stamp a timestamp. It does not validate the document.
+**Single responsibility.** Each callback does exactly one thing. `triggerDocumentSentEmail` sends an email. It does not stamp a timestamp, validate document fields, or update any status.
 
-**Rule 2: Idempotent.** If the same event is emitted twice (duplicate delivery from a queue), the callback must produce the same result without side effects. For emails: check if the email was already sent before sending. For storage: check if the file already exists before saving.
+**Idempotency.** If the same event is delivered twice — which happens with any retry-capable queue — the callback produces no additional side effects on the second delivery. Before sending an email, check whether it was already sent. Before saving a file, check whether it already exists.
 
-**Rule 3: No direct DB writes.** Callbacks that need to update document state must call `DocumentService.transition()` — never write to the documents table directly. This prevents bypassing the transition guard.
+**No direct state writes.** A callback that needs to change document state calls `DocumentService.transition()`. It never writes to the `documents` table directly. Bypassing the transition function bypasses the audit log.
 
-**Rule 4: Fail in isolation.** A failing `saveToConnectedStorage` callback must not prevent `triggerDocumentSignedEmail` from running. Log the failure, retry with backoff, alert if persistent. Never let one callback's failure cascade.
+**Independent failure.** If `saveDocumentToStorage` throws, `triggerDocumentSignedEmail` still runs. Callbacks are isolated. One failure logs and retries; it does not cancel the other handlers for that event.
 
 ---
 
-## 6. Email Automation System
+## 7. Email Automation
 
-### 6.1 The Email Registry Pattern
+### 7.1 The Declarative Email Registry
+
+Each email is a self-contained definition. It knows its own template, how to resolve its recipient, how to construct its subject line, and how to fetch its own data. The caller provides only two things: the email key and the document ID.
 
 ```ts
 // emails/registry.ts
@@ -434,10 +493,12 @@ interface EmailDefinition {
   to: (data: EmailData) => string | string[];
   cc?: (data: EmailData) => string[];
   getData: (documentId: string) => Promise<EmailData>;
-  testFixture?: EmailData; // for preview routes and tests
+
+  // Used by preview routes and test suites — no live sends required
+  testFixture?: EmailData;
 }
 
-export const emailRegistry: Record<string, EmailDefinition> = {
+export const emailRegistry = {
   documentSent: {
     template: "document-sent",
     subject: (d) => `Please review and sign: ${d.document.title}`,
@@ -459,7 +520,7 @@ export const emailRegistry: Record<string, EmailDefinition> = {
     template: "document-signed",
     subject: (d) => `Signed: ${d.document.title}`,
     to: (d) => d.owner.email,
-    cc: (d) => d.signers.map((s) => s.email), // all signers get a copy
+    cc: (d) => d.signers.map((s) => s.email), // all signers receive a confirmed copy
     getData: (id) => EmailDataService.forDocument(id),
     testFixture: fixtures.documentSigned,
   },
@@ -475,7 +536,7 @@ export const emailRegistry: Record<string, EmailDefinition> = {
 
   documentExpired: {
     template: "document-expired",
-    subject: (d) => `"${d.document.title}" has expired unsigned`,
+    subject: (d) => `"${d.document.title}" expired before signing`,
     to: (d) => d.owner.email,
     getData: (id) => EmailDataService.forDocument(id),
     testFixture: fixtures.documentExpired,
@@ -488,98 +549,137 @@ export const emailRegistry: Record<string, EmailDefinition> = {
     getData: (id) => EmailDataService.forDocument(id),
     testFixture: fixtures.documentRevoked,
   },
-};
+} satisfies Record<string, EmailDefinition>;
 
-// The entire public API for sending any Doclast email:
+// The entire public API for sending any email Doclast sends:
 export async function sendDocumentEmail(
   key: keyof typeof emailRegistry,
   documentId: string,
 ): Promise<void> {
-  const definition = emailRegistry[key];
-  const data = await definition.getData(documentId);
-  const to = definition.to(data);
-  const subject = definition.subject(data);
+  const def = emailRegistry[key];
+  const data = await def.getData(documentId);
 
   await emailProvider.send({
-    template: definition.template,
-    to,
-    cc: definition.cc?.(data),
-    subject,
+    template: def.template,
+    to: def.to(data),
+    cc: def.cc?.(data),
+    subject: def.subject(data),
     data,
   });
 }
 ```
 
-### 6.2 Email Provider Abstraction
+### 7.2 Provider Abstraction
 
-The email registry must not depend on a specific email provider. Wrap the provider behind an interface so switching from SendGrid to Postmark to Resend requires changing one file.
+The email registry must never depend on a specific provider. Switching from Resend to SendGrid to Postmark must require changing exactly one file.
 
 ```ts
 // emails/provider.ts
+
 interface EmailProvider {
   send(options: SendOptions): Promise<void>;
 }
 
-// Production
-export const emailProvider: EmailProvider = new ResendProvider(
-  process.env.RESEND_API_KEY,
-);
-
-// Tests
-export const emailProvider: EmailProvider = new InMemoryEmailProvider();
+// Resolved at application startup:
+export const emailProvider: EmailProvider =
+  process.env.NODE_ENV === "test"
+    ? new InMemoryEmailProvider()
+    : new ResendProvider(process.env.RESEND_API_KEY);
 ```
 
-### 6.3 Deduplication
+### 7.3 Send Deduplication
 
-Before sending any email, check if the same email type was already sent for this document within a deduplication window. This prevents duplicate sends from retry logic or bug-induced double emissions.
+Retry logic, duplicate event emissions, and race conditions can all cause the same email to be sent twice. Deduplicate at the send layer, not at the call sites.
 
 ```ts
-async function sendDocumentEmail(
-  key: string,
+export async function sendDocumentEmail(
+  key: keyof typeof emailRegistry,
   documentId: string,
 ): Promise<void> {
   const dedupKey = `email:${key}:${documentId}`;
 
-  // Check Redis or DB for recent sends of this email type for this document
-  const alreadySent = await dedup.check(dedupKey, { window: "24h" });
+  // Use Redis with a TTL window, or a deduplicated DB record.
+  // The dedup window should be longer than the longest possible retry interval.
+  const alreadySent = await dedup.check(dedupKey, { ttlSeconds: 86400 });
   if (alreadySent) {
-    logger.warn(`Duplicate email suppressed: ${dedupKey}`);
+    logger.warn({ dedupKey }, "Duplicate email suppressed");
     return;
   }
 
   await dedup.mark(dedupKey);
-  // ... rest of send logic
+
+  const def = emailRegistry[key];
+  const data = await def.getData(documentId);
+
+  await emailProvider.send({
+    template: def.template,
+    to: def.to(data),
+    cc: def.cc?.(data),
+    subject: def.subject(data),
+    data,
+  });
 }
 ```
 
 ---
 
-## 7. Workflow Automation and Scheduled Jobs
+## 8. Scheduled Jobs and Workflow Automation
 
-### 7.1 Job Registry
+### 8.1 Design Rules for Cron Jobs
+
+Before listing the jobs, three rules:
+
+**Rule 1: Cron jobs use the same interfaces as API handlers.** A cron job that expires a document calls `DocumentService.transition()` exactly as an API handler would. It does not bypass state logic just because there is no HTTP request involved. This guarantees the audit log is always complete.
+
+**Rule 2: Cron queries must be fully index-backed.** An unindexed scan of the documents table at 50,000 rows will degrade noticeably. At 500,000 rows it becomes an operational incident. Every `WHERE` clause in every cron query must have a corresponding index defined in the initial migration (see §4.4).
+
+**Rule 3: Every job iterates with cursor-based pagination.** `findMany({ where: { status: 'sent' } })` without pagination loads every matching row into memory at once. At scale, this causes OOM errors. Use batch iteration from day one.
+
+```ts
+// Reusable cursor-based batch iterator
+async function* batchQuery<T extends { id: string }>(
+  queryFn: (cursor?: string) => Promise<T[]>,
+  batchSize = 100,
+): AsyncGenerator<T[]> {
+  let cursor: string | undefined;
+  do {
+    const batch = await queryFn(cursor);
+    if (!batch.length) return;
+    yield batch;
+    cursor = batch.at(-1)?.id;
+  } while (cursor);
+}
+```
+
+### 8.2 The Job Registry
 
 ```ts
 // cron/jobs.ts
 
-export const cronJobs = [
+export const cronJobs: CronJobDefinition[] = [
   {
     name: "enforceDocumentExpiry",
     schedule: "0 * * * *", // every hour
     handler: async () => {
-      // Find all documents where expiresAt has passed and status is not terminal
-      const overdue = await db.documents.findMany({
-        where: {
-          expiresAt: { lte: new Date() },
-          status: { notIn: ["signed", "expired", "revoked"] },
-        },
-      });
-      for (const doc of overdue) {
-        await DocumentService.transition(doc.id, "document.expired", {
-          actorType: "cron",
-          actorId: "enforceDocumentExpiry",
-        });
+      for await (const batch of batchQuery((cursor) =>
+        db.documents.findMany({
+          where: {
+            expiresAt: { lte: new Date() },
+            status: { notIn: TERMINAL_STATUSES },
+          },
+          take: 100,
+          cursor: cursor ? { id: cursor } : undefined,
+          orderBy: { id: "asc" },
+        }),
+      )) {
+        for (const doc of batch) {
+          await DocumentService.transition(
+            doc.id,
+            "document.expired",
+            CRON_ACTOR,
+          );
+        }
       }
-      logger.info(`Expired ${overdue.length} documents`);
     },
   },
 
@@ -587,51 +687,55 @@ export const cronJobs = [
     name: "sendSignatureReminders",
     schedule: "0 */6 * * *", // every 6 hours
     handler: async () => {
-      const REMINDER_THRESHOLD_HOURS = 48;
-      const REMINDER_COOLDOWN_HOURS = 24; // don't re-remind within 24h
+      const REMINDER_AFTER_HOURS = 48;
+      const REMINDER_COOLDOWN_HRS = 24;
+      const cutoff = subHours(new Date(), REMINDER_AFTER_HOURS);
+      const cooldown = subHours(new Date(), REMINDER_COOLDOWN_HRS);
 
-      const stale = await db.documents.findMany({
-        where: {
-          status: { in: ["sent", "viewed"] },
-          sentAt: { lte: subHours(new Date(), REMINDER_THRESHOLD_HOURS) },
-          reminderSentAt: {
-            OR: [
-              { equals: null },
-              { lte: subHours(new Date(), REMINDER_COOLDOWN_HOURS) },
-            ],
+      for await (const batch of batchQuery((cursor) =>
+        db.documents.findMany({
+          where: {
+            status: { in: ["sent", "viewed"] },
+            sentAt: { lte: cutoff },
+            expiresAt: { OR: [{ equals: null }, { gt: new Date() }] },
+            reminderSentAt: { OR: [{ equals: null }, { lte: cooldown }] },
           },
-          expiresAt: { OR: [{ equals: null }, { gte: new Date() }] }, // not expired
-        },
-      });
-
-      for (const doc of stale) {
-        await sendDocumentEmail("signatureReminder", doc.id);
-        await db.documents.update(doc.id, { reminderSentAt: new Date() });
+          take: 100,
+          cursor: cursor ? { id: cursor } : undefined,
+          orderBy: { id: "asc" },
+        }),
+      )) {
+        for (const doc of batch) {
+          await sendDocumentEmail("signatureReminder", doc.id);
+          await db.documents.update(doc.id, { reminderSentAt: new Date() });
+        }
       }
     },
   },
 
   {
     name: "sendExpiryWarnings",
-    schedule: "0 8 * * *", // daily at 8am
+    schedule: "0 8 * * *", // daily at 08:00 UTC
     handler: async () => {
-      const WARNING_WINDOW_HOURS = 48;
+      const WARNING_WINDOW_HRS = 48;
+      const warningCutoff = addHours(new Date(), WARNING_WINDOW_HRS);
 
-      // Find documents expiring in the next 48 hours that haven't been warned
-      const approaching = await db.documents.findMany({
-        where: {
-          expiresAt: {
-            gte: new Date(),
-            lte: addHours(new Date(), WARNING_WINDOW_HOURS),
+      for await (const batch of batchQuery((cursor) =>
+        db.documents.findMany({
+          where: {
+            expiresAt: { gte: new Date(), lte: warningCutoff },
+            status: { notIn: TERMINAL_STATUSES },
+            expiryWarnedAt: { equals: null },
           },
-          status: { notIn: ["signed", "expired", "revoked"] },
-          expiryWarnedAt: { equals: null }, // add this field to schema
-        },
-      });
-
-      for (const doc of approaching) {
-        await sendDocumentEmail("expiryWarning", doc.id);
-        await db.documents.update(doc.id, { expiryWarnedAt: new Date() });
+          take: 100,
+          cursor: cursor ? { id: cursor } : undefined,
+          orderBy: { id: "asc" },
+        }),
+      )) {
+        for (const doc of batch) {
+          await sendDocumentEmail("expiryWarning", doc.id);
+          await db.documents.update(doc.id, { expiryWarnedAt: new Date() });
+        }
       }
     },
   },
@@ -640,7 +744,7 @@ export const cronJobs = [
     name: "advanceSigningQueue",
     schedule: "*/15 * * * *", // every 15 minutes
     handler: async () => {
-      // Find documents where all signers of order N have signed,
+      // Find documents where all signers of order N have signed
       // but signers of order N+1 have not yet been notified.
       const ready = await SignerService.findReadyForNextSequence();
       for (const { documentId, nextSigners } of ready) {
@@ -651,78 +755,79 @@ export const cronJobs = [
 
   {
     name: "archiveAbandonedDrafts",
-    schedule: "0 3 * * *", // daily at 3am
+    schedule: "0 3 * * *", // daily at 03:00 UTC
     handler: async () => {
-      await db.documents.updateMany({
-        where: {
-          status: "draft",
-          updatedAt: { lte: subDays(new Date(), 30) },
-        },
-        data: {
-          status: "revoked",
-          revokedAt: new Date(),
-        },
-      });
+      const threshold = subDays(new Date(), 30);
+      for await (const batch of batchQuery((cursor) =>
+        db.documents.findMany({
+          where: { status: "draft", updatedAt: { lte: threshold } },
+          take: 100,
+          cursor: cursor ? { id: cursor } : undefined,
+          orderBy: { id: "asc" },
+        }),
+      )) {
+        for (const doc of batch) {
+          await DocumentService.transition(
+            doc.id,
+            "document.revoked",
+            CRON_ACTOR,
+            { reason: "abandoned_draft_cleanup" },
+          );
+        }
+      }
     },
   },
 ];
 ```
 
-### 7.2 Job Observability
+### 8.3 Job Observability
 
-Every cron job must emit structured logs and metrics. At minimum:
+Every job emits structured logs and metrics. This is not optional — it is how you know whether the system is working in production.
 
 ```ts
 // cron/runner.ts
-async function runJob(job: CronJob): Promise<void> {
-  const startTime = Date.now();
-  logger.info({ job: job.name, event: "cron.job.started" });
+
+async function runJob(job: CronJobDefinition): Promise<void> {
+  const start = Date.now();
+  logger.info({ job: job.name }, "cron job started");
 
   try {
     await job.handler();
-    metrics.increment("cron.job.success", { job: job.name });
-    metrics.timing("cron.job.duration", Date.now() - startTime, {
-      job: job.name,
-    });
-    logger.info({
-      job: job.name,
-      event: "cron.job.completed",
-      durationMs: Date.now() - startTime,
-    });
-  } catch (err) {
-    metrics.increment("cron.job.failure", { job: job.name });
-    logger.error({
-      job: job.name,
-      event: "cron.job.failed",
-      error: err.message,
-    });
-    alerting.notify(`Cron job failed: ${job.name}`, err);
+    const duration = Date.now() - start;
+    metrics.increment("cron.success", { job: job.name });
+    metrics.timing("cron.duration_ms", duration, { job: job.name });
+    logger.info({ job: job.name, durationMs: duration }, "cron job completed");
+  } catch (error) {
+    metrics.increment("cron.failure", { job: job.name });
+    logger.error({ job: job.name, error }, "cron job failed");
+    alerts.fire(`Cron job failed: ${job.name}`, { error, job: job.name });
   }
 }
 ```
 
 ---
 
-## 8. Audit Trail and Compliance
+## 9. Audit Trail and Legal Compliance
 
-### 8.1 Why This Matters for Doclast
+### 9.1 The Legal Requirement
 
-A signed contract carries legal weight. In any dispute, Doclast must be able to produce evidence that:
+A signed Doclast contract is a legal instrument. In the event of a dispute, the following must be provable:
 
-- The correct document was sent to the correct party
-- The signer opened the document and had access to it for sufficient time
-- The signature was collected from the expected person (verified email)
-- The document content was not altered after signing
-- The audit log itself has not been tampered with
+1. The specific document version that was sent (not a later revision)
+2. That the signing link was delivered to the correct email address
+3. That the signer opened the document and had meaningful access to it
+4. That the signature was collected from the party who received the email
+5. That the document content was not modified after signing
+6. That the audit record itself has not been altered
 
-Without an intentional audit design, Doclast cannot provide this evidence. The architecture must be designed for it from day one.
+Without deliberate architecture for each of these, Doclast cannot produce legally credible evidence. This is not a compliance checkbox — it is a core product guarantee.
 
-### 8.2 The Append-Only Event Chain
+### 9.2 Append-Only Audit Event Chain
 
-As specified in Section 3.3, every state change appends a record to `document_events`. The integrity chain makes retrospective tampering detectable:
+Every call to `DocumentService.transition()` appends a record to `document_events` inside the same database transaction. The record contains a cryptographic hash chained from the previous event. Modifying any past event breaks the hash chain from that point forward, making tampering detectable.
 
 ```ts
-async function appendEvent(
+async function appendAuditEvent(
   tx: Transaction,
   params: {
     documentId: string;
@@ -732,40 +837,39 @@ async function appendEvent(
     metadata: Record<string, unknown>;
   },
 ): Promise<DocumentEvent> {
-  // Get the previous event to chain integrity hashes
-  const previousEvent = await tx.documentEvents.findLatest(params.documentId);
+  const previous = await tx.documentEvents.findLatest(params.documentId);
 
-  const eventData = {
+  // The hash input includes the previous hash, making this a chain.
+  // Any modification of a past event breaks all subsequent hashes.
+  const integrityHash = computeHash({
+    previousHash: previous?.integrityHash ?? null,
+    event: params.event,
+    actorId: params.actor.id ?? null,
+    occurredAt: params.occurredAt.toISOString(),
+    metadata: params.metadata,
+  });
+
+  return tx.documentEvents.create({
     ...params,
-    previousEventId: previousEvent?.id ?? null,
-  };
-
-  // Hash = SHA-256 of (previousHash + eventType + actorId + occurredAt + metadata)
-  const integrityHash = computeIntegrityHash(
-    previousEvent?.integrityHash,
-    eventData,
-  );
-
-  return tx.documentEvents.create({ ...eventData, integrityHash });
+    previousEventId: previous?.id ?? null,
+    integrityHash,
+  });
 }
 ```
 
-### 8.3 The Signature Hash
+### 9.3 Signature Hash
 
-When a document is signed, store a hash that allows independent verification:
+The signature hash is the cornerstone of Doclast's legal credibility. It allows any party — including a court, without contacting Doclast — to verify that a specific PDF was signed by a specific person at a specific time.
 
 ```ts
-// Input to hash: document content + signer email + timestamp + document ID
-// Output: a hex string stored on the document record
-
 function computeSignatureHash(params: {
-  documentContent: Buffer; // the exact bytes of the PDF that was signed
+  documentBytes: Buffer; // the exact bytes of the PDF presented for signing
   signerEmail: string;
   signedAt: Date;
   documentId: string;
 }): string {
   return createHash("sha256")
-    .update(params.documentContent)
+    .update(params.documentBytes)
     .update(params.signerEmail)
     .update(params.signedAt.toISOString())
     .update(params.documentId)
@@ -773,113 +877,93 @@ function computeSignatureHash(params: {
 }
 ```
 
-The signer receives this hash in their confirmation email. Any party can recompute the hash from the original PDF and verify it matches — without trusting Doclast's servers.
+The hash is stored on the `document_signers` row. It is also embedded in the signed PDF (as a metadata field) and included in the confirmation email to the signer. The signer can verify it independently at any time by recomputing the hash from their copy of the PDF.
 
-### 8.4 Audit Trail API
+### 9.4 Audit Trail API
 
-Expose a read-only endpoint that returns the full, verified event chain for a document. This is what legal proceedings require.
+The audit trail endpoint is read-only and publicly accessible to document owners. It verifies the integrity chain on every request and returns a human-readable representation of the document's history.
 
 ```ts
 // GET /api/documents/:id/audit-trail
+// Response:
 
 interface AuditTrailResponse {
   documentId: string;
-  verified: boolean; // true if all integrity hashes in the chain are valid
+  chainIntact: boolean; // false if any event hash fails verification
   events: Array<{
     id: string;
     event: DocumentEventType;
     actorType: string;
-    actorId: string | null;
+    actorLabel: string; // human-readable: "Owner", "Signer (alice@example.com)", "System"
     occurredAt: Date;
+    description: string; // e.g. "Document sent to alice@example.com"
     metadata: Record<string, unknown>;
-    integrityHash: string;
-    chainValid: boolean; // true if this event's hash is valid against the previous
+    hashValid: boolean;
   }>;
 }
 ```
 
-### 8.5 Data Retention Policy
+### 9.5 Database-Level Access Controls
 
-Define this before launch — retrofitting it is expensive:
+The `document_events` table must be protected at the database level, not just the application level.
 
-| Data type                  | Retention                    | Reason                                      |
-| -------------------------- | ---------------------------- | ------------------------------------------- |
-| Signed documents           | 7 years                      | Standard contract law in most jurisdictions |
-| Audit event log            | 7 years                      | Same — legal evidence                       |
-| Draft documents (unsigned) | 90 days after abandonment    | No legal obligation, storage cost           |
-| Email delivery logs        | 1 year                       | Dispute resolution                          |
-| OTP codes                  | Delete immediately after use | Security                                    |
-| IP addresses in audit log  | Anonymize after 2 years      | GDPR                                        |
+```sql
+-- The application database user cannot INSERT, UPDATE, or DELETE on this table.
+-- Only the dedicated audit_writer role can append rows.
+-- This means a compromised application cannot silently alter the audit log.
+
+REVOKE INSERT, UPDATE, DELETE ON document_events FROM app_user;
+GRANT  INSERT                  ON document_events TO audit_writer;
+GRANT  SELECT                  ON document_events TO app_user;
+```
+
+### 9.6 Data Retention Policy
+
+Define retention rules before launch. Retrofitting them into a running system with live legal data is complex and risky.
+
+| Data                              | Retention                                                       | Rationale                                           |
+| --------------------------------- | --------------------------------------------------------------- | --------------------------------------------------- |
+| Signed documents and audit logs   | 7 years                                                         | Standard contract law minimum in most jurisdictions |
+| Unsigned draft documents          | 90 days after last activity                                     | No legal obligation; reduces storage cost           |
+| OTP codes                         | Delete immediately on use; expire unused codes after 10 minutes | Security                                            |
+| Email delivery receipts           | 1 year                                                          | Sufficient for dispute resolution                   |
+| IP addresses in audit records     | Anonymize after 2 years                                         | GDPR compliance                                     |
+| Session tokens and refresh tokens | Delete on logout; expire unused tokens after 30 days            | Security                                            |
 
 ---
 
-## 9. Missing Components and Services
+## 10. Missing Services and Gaps
 
-These are services that Doclast's architecture will require but that are not addressed in the current design.
+The following services are required for production but are not yet fully addressed in the current architecture. Each is a self-contained module that can be built independently.
 
-### 9.1 Document Generation Service
+### 10.1 Document Generation Service
 
-Document generation (filling a template with form data → rendering a PDF) must be behind a queue, not in the API request path. PDF rendering is CPU-intensive and can take 500ms–3s. Blocking an HTTP request for that duration degrades the entire API.
+PDF and DOCX rendering is CPU-bound work that can take 500ms to 3 seconds depending on template complexity. Keeping this in the API request path creates latency spikes, timeouts under load, and cascading failures when the renderer is slow.
 
-```
-Owner submits form
-      │
-      ▼
-API creates Document record (status: 'draft')
-API enqueues generation job
-API returns 202 Accepted immediately
-      │
-      ▼ (async, via BullMQ or similar)
-Generation worker picks up job
-Renders PDF/DOCX from template + fields
-Stores file to owner's connected storage
-Emits 'document.generated' event
-      │
-      ▼
-Document status → 'ready_to_send'
-Owner gets notified (push/email) that document is ready
-```
+The correct pattern: the API enqueues a generation job and returns `202 Accepted` immediately. A pool of worker processes picks up jobs, renders the document, stores it, and emits `document.generated`. The owner receives a notification when their document is ready to send.
 
-This pattern also enables retry logic if rendering fails, progress indicators in the UI, and decoupled scaling of the rendering workers.
+This architecture also enables priority queues (Pro plan renders before Free plan), retry logic for failed renders, and horizontal scaling of rendering capacity independent of API capacity.
 
-### 9.2 Signing Link Service
+### 10.2 Signing Link Service
 
-The link sent to signers must be:
+Signing links must satisfy four requirements: unique per document and signer, time-bound to match the document's `expiresAt`, single-use after the document is signed, and self-verifying without a database lookup.
 
-- Unique per document + signer
-- Time-limited (expires when the document does)
-- Single-use after signing is complete
-- Verifiable without a database lookup (JWT with embedded claims)
+JWT satisfies all four. The token embeds `documentId`, `signerEmail`, and expiry. Verification requires only the signing secret — no database round trip. After a document is signed, the server adds the token's `jti` (JWT ID) to a Redis blocklist. Any subsequent attempt with the same token is rejected.
 
-```ts
-// signing-links/service.ts
+### 10.3 OTP Verification Service
 
-function generateSigningLink(params: {
-  documentId: string;
-  signerEmail: string;
-  expiresAt: Date | null;
-}): string {
-  const token = jwt.sign(
-    {
-      sub: params.signerEmail,
-      doc: params.documentId,
-      type: "signing",
-    },
-    process.env.SIGNING_LINK_SECRET,
-    {
-      expiresIn: params.expiresAt
-        ? Math.floor((params.expiresAt.getTime() - Date.now()) / 1000)
-        : "30d",
-    },
-  );
+The current ContractFlow uses OTP for signer identity verification. This service needs explicit design:
 
-  return `${process.env.BASE_URL}/sign/${token}`;
-}
-```
+- 6-digit codes generated with cryptographic randomness (not `Math.random()`)
+- Stored in Redis with a 10-minute TTL — never in the application database
+- Rate-limited to 5 attempts per email address per hour (a Redis counter with TTL)
+- Immediately deleted from Redis after successful use
+- The code value itself never appears in any log line
+- A new code request invalidates any existing pending code for that email
 
-### 9.3 Storage Abstraction Layer
+### 10.4 Storage Abstraction Layer
 
-Doclast supports Drive, Dropbox, and Box. The lifecycle logic must not know which provider is active. Define a storage interface and implement it per provider:
+Doclast stores documents in the owner's connected storage, not on Doclast's servers. The lifecycle layer must be completely agnostic to which provider is active.
 
 ```ts
 interface StorageProvider {
@@ -887,279 +971,328 @@ interface StorageProvider {
     content: Buffer;
     filename: string;
     mimeType: string;
+    folder?: string;
   }): Promise<StoredFile>;
-  getDownloadUrl(fileId: string): Promise<string>;
+
+  getDownloadUrl(fileId: string, expiresInSeconds?: number): Promise<string>;
   delete(fileId: string): Promise<void>;
+  exists(fileId: string): Promise<boolean>;
 }
 
-// Implementations: GoogleDriveProvider, DropboxProvider, BoxProvider, InternalProvider
-// The document record stores: storageProvider, storagePath, storageFileId
-// The lifecycle layer calls: StorageFactory.forOwner(owner).save(...)
+// Implementations: GoogleDriveProvider, DropboxProvider, BoxProvider
+// Factory resolves the correct provider at runtime based on owner configuration:
+// StorageFactory.forOwner(owner).save(...)
 ```
 
-### 9.4 OTP / Verification Service
+The document record stores `storageProvider`, `storagePath`, and `storageFileId`. No other layer in the system needs to know which provider is active.
 
-The current flow uses OTP email for signer verification. This service needs its own module:
+### 10.5 Webhook Service
 
-- Generate a 6-digit code
-- Store the code with a TTL of 10 minutes (Redis, not the documents DB)
-- Rate-limit attempts per email address (max 5 attempts before lockout)
-- Delete the code immediately after successful use
-- Never log the code value itself
+When Doclast expands to support integrations, customers will expect webhooks for events like `document.signed` and `document.expired`. The event log is already the perfect source for these.
 
-### 9.5 Webhook Service (Future)
+Design the webhook system as a subscription model on top of the existing event stream: customers subscribe to specific event types, and a webhook dispatcher reads from `document_events` and delivers matching events to customer endpoints. The dispatcher handles retries, delivery receipts, and signature verification of outbound payloads.
 
-When Doclast adds integrations, customers will need webhooks. Design the event log to double as a webhook event source from the start — every `document_events` entry is a candidate webhook payload. Adding webhooks later becomes a subscription model on top of an existing event stream, not a new system.
+Building the event log correctly now means adding webhooks later requires no schema changes — only the subscriber and dispatcher services.
+
+### 10.6 Rate Limiting
+
+Document creation, signing link generation, and email sends all need rate limits, applied at the workspace level rather than per-user:
+
+| Action                  | Rate Limit                   |
+| ----------------------- | ---------------------------- |
+| Document creation       | 100 per workspace per hour   |
+| Signing link generation | 20 per document              |
+| Email sends (any type)  | 500 per workspace per day    |
+| OTP requests            | 5 per email address per hour |
+| Audit trail reads       | 60 per document per hour     |
 
 ---
 
-## 10. Scalability Considerations
+## 11. Scalability and Multi-Tenancy
 
-### 10.1 Database
+### 11.1 Database Scaling
 
-The mutable `documents` table and the append-only `document_events` table have different read/write patterns and should be optimized independently.
+The `documents` and `document_events` tables have fundamentally different characteristics and must be optimized independently.
 
-`documents` is read-heavy and written on every state transition. It benefits from read replicas for dashboard queries and row-level locking on writes (already covered by the transaction pattern in Section 4.2).
+`documents` is read-heavy and mutated on every transition. It benefits from a read replica for dashboard queries and analytics. Write contention is handled by the row-level lock in `transition()` (see §5.2) — only one transition can proceed on a given document at a time.
 
-`document_events` is write-heavy and append-only. It should never be updated or deleted. Consider a separate table partition per month or per year once volume warrants it. For compliance, this table should live in a separate schema with restricted write access — only the event-appending service account can insert rows.
+`document_events` is write-heavy and strictly append-only. It grows without bound and must be partitioned by time (monthly or yearly) once it exceeds manageable size. For compliance reasons, it must reside in a separate database schema with write access restricted to the audit writer service account (see §9.5).
 
-### 10.2 The Generation Queue
+### 11.2 Generation Queue Scaling
 
-Document rendering workers should scale horizontally, independent of the API servers. Use a job queue (BullMQ on Redis, or a managed service like Inngest) with:
+Rendering workers are stateless and CPU-bound. They scale horizontally independent of the API servers. Key configuration decisions:
 
-- Concurrency limits per worker to prevent CPU saturation
-- Dead letter queue for failed jobs with alerting
-- Job prioritization (Pro plan documents before Free plan)
+- **Concurrency per worker:** limit to prevent CPU saturation (typically 2–4 concurrent renders per core)
+- **Dead letter queue:** failed render jobs should be captured with full context for debugging and manual retry
+- **Priority lanes:** implement separate queues for Pro and Free plan renders so high-value customers are never behind a burst of free-tier activity
+- **Timeout:** render jobs that exceed 30 seconds are likely stuck; mark as failed and trigger a retry
 
-### 10.3 Cron Jobs at Scale
+### 11.3 Multi-Tenancy
 
-A single cron runner is sufficient until Doclast has tens of thousands of active documents. At that point, batch jobs that iterate over all documents become slow. The solution is not to rewrite them — it is to ensure the cron queries are index-backed (covered in Section 3.4) and the iteration uses cursor-based pagination:
+Doclast will serve teams and organizations, not just individual users. The schema must reflect this from the start. `workspaceId` is already present on the `Document` interface (§4.1) — ensure it is also present on `document_signers`, `document_events`, and any future tables.
 
-```ts
-// Instead of: findMany({ where: { status: 'sent' } })
-// Use cursor pagination to avoid loading 50,000 rows at once:
+Row-level access policies are enforced at the service layer, never in SQL. This means:
 
-async function* iterateSentDocuments() {
-  let cursor: string | undefined;
-  do {
-    const batch = await db.documents.findMany({
-      where: { status: "sent" },
-      take: 100,
-      cursor: cursor ? { id: cursor } : undefined,
-      orderBy: { id: "asc" },
-    });
-    yield batch;
-    cursor = batch.at(-1)?.id;
-  } while (cursor);
-}
-```
+- `DocumentService` always filters queries by `workspaceId` derived from the authenticated session
+- No query across the documents table is issued without a `workspaceId` constraint
+- Workspace isolation is tested explicitly as part of the security test suite
 
-### 10.4 Multi-Tenancy
+### 11.4 Observability Requirements
 
-Doclast will eventually serve teams and organizations, not just individual users. Design the schema for it now:
+The following metrics must be captured and visible in a dashboard before launching to production:
 
-- `workspaceId` on all documents (present in Section 3.1)
-- Row-level access policies enforced at the service layer, not the API layer
-- Workspace-level rate limits on document creation, email sends, and signing link generation
-- Separate billing records per workspace for addon usage tracking
+| Metric                                                               | Why                                                           |
+| -------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `documents.transitions_per_minute` by status                         | Detect activity spikes and stalled workflows                  |
+| `documents.time_to_sign_p50_p95`                                     | Core SLA metric; identifies friction in the signing flow      |
+| `emails.sent`, `emails.bounced`, `emails.opened`                     | Signer engagement; delivery health                            |
+| `cron.job_duration_ms` per job                                       | Detect jobs growing slower as data volume increases           |
+| `generation.queue_depth` and `generation.render_duration_ms`         | Rendering pipeline health                                     |
+| `signing_links.valid`, `signing_links.expired`, `signing_links.used` | Security and expiry health                                    |
+| `audit_events.chain_violations`                                      | Should always be zero; any non-zero value is a critical alert |
 
 ---
 
-## 11. Architecture Diagrams
+## 12. System Architecture Diagrams
 
-### 11.1 System Layers
+### 12.1 System Layers
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CLIENT LAYER                              │
-│   Landing page (static HTML)    Contract flow (Vue 3 iframe)    │
-└────────────────────────────┬────────────────────────────────────┘
-                             │  HTTPS
-┌────────────────────────────▼────────────────────────────────────┐
-│                         API LAYER                                │
-│   POST /documents         GET /documents/:id                     │
-│   POST /documents/:id/send   POST /sign/:token                  │
-│   GET  /documents/:id/audit-trail                               │
-└──────┬──────────────┬──────────────────┬───────────────────────┘
-       │              │                  │
-┌──────▼──────┐ ┌─────▼──────┐  ┌───────▼────────┐
-│  Document   │ │  Signing   │  │  Audit Trail   │
-│  Service   │ │  Service   │  │  Service       │
-│  (FSM +    │ │  (JWT +    │  │  (read-only,   │
-│  callbacks)│ │  OTP)      │  │  verified)     │
-└──────┬──────┘ └─────┬──────┘  └────────────────┘
-       │              │
-┌──────▼──────────────▼─────────────────────────────────────────┐
-│                      EVENT BUS                                  │
-│  document.sent → [triggerEmail, startReminderTracking]          │
-│  document.signed → [verifyHash, triggerEmail, saveToStorage]    │
-│  document.expired → [triggerEmail, blockSigningLink]            │
-└───────────────┬────────────────────────────────────────────────┘
-                │
-     ┌──────────┼──────────────┐
-     │          │              │
-┌────▼────┐ ┌──▼──────┐ ┌─────▼──────────┐
-│  Email  │ │ Storage │ │   Document     │
-│ Service │ │Abstraction│ │  Event Log    │
-│(Resend/ │ │(Drive/  │ │(append-only,  │
-│SendGrid)│ │Dropbox/ │ │hashed chain)  │
-└─────────┘ │Box)     │ └───────────────┘
-            └─────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                          CLIENT LAYER                             │
+│   Landing page (static HTML)    ContractFlow (Vue 3, in iframe)  │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ HTTPS
+┌──────────────────────────────▼───────────────────────────────────┐
+│                           API LAYER                               │
+│  POST /documents                 GET /documents/:id               │
+│  POST /documents/:id/send        POST /sign/:token (JWT)         │
+│  POST /documents/:id/revoke      GET  /documents/:id/audit-trail │
+└───────┬──────────────┬───────────────────────┬───────────────────┘
+        │              │                       │
+┌───────▼──────┐ ┌─────▼──────────┐  ┌────────▼──────────────┐
+│  Document    │ │  Signing Link  │  │  Audit Trail Service  │
+│  Service     │ │  Service       │  │  (read-only,          │
+│  (FSM +      │ │  (JWT + OTP)   │  │   chain-verified)     │
+│  callbacks)  │ └────────────────┘  └───────────────────────┘
+└───────┬──────┘
+        │ emits after transaction commits
+┌───────▼───────────────────────────────────────────────────────┐
+│                        EVENT BUS                               │
+│  document.sent    → [triggerEmail, startReminderTracking]      │
+│  document.signed  → [verifyHash, triggerEmail, saveToStorage]  │
+│  document.expired → [triggerEmail, invalidateLinks]            │
+└───┬───────────────────┬───────────────────────────────────────┘
+    │                   │
+┌───▼────────────┐ ┌───▼──────────────┐ ┌──────────────────────┐
+│ Email Service  │ │ Storage Layer    │ │ Document Event Log   │
+│ (Resend)       │ │ (Drive/Dropbox/  │ │ (append-only,        │
+│                │ │  Box/internal)   │ │  hashed chain,       │
+└────────────────┘ └──────────────────┘ │  restricted writes)  │
+                                        └──────────────────────┘
 
-           ┌─────────────────────────────────────┐
-           │            CRON LAYER               │
-           │  enforceExpiry (hourly)             │
-           │  sendReminders (every 6h)           │
-           │  sendExpiryWarnings (daily)         │
-           │  advanceSigningQueue (every 15min)  │
-           │  archiveAbandonedDrafts (daily)     │
-           └──────────────┬──────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                       ASYNC LAYERS                             │
+│                                                               │
+│  GENERATION QUEUE (BullMQ)           CRON LAYER               │
+│  ─────────────────────────          ────────────────────────  │
+│  render PDF/DOCX from fields         enforceExpiry  (hourly)  │
+│  store to owner storage              sendReminders  (6h)      │
+│  emit document.generated             sendWarnings   (daily)   │
+│                                      advanceQueue   (15min)   │
+│                                      archiveDrafts  (daily)   │
+│                                                               │
+│  Both layers call DocumentService.transition() and            │
+│  sendDocumentEmail() — same interfaces as the API layer.      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 Document Lifecycle with Actors
+
+```
+OWNER                     SYSTEM                      SIGNER
+  │                          │                            │
+  │─── fills form ──────────►│                            │
+  │                   creates document (draft)            │
+  │                          │                            │
+  │─── clicks Send ─────────►│                            │
+  │                   enqueues generation job             │
+  │                          │ (async)                    │
+  │                   renders PDF                         │
+  │                   stores to Drive                     │
+  │                   status → sent ──────── email ──────►│
+  │                   appends audit event                 │
+  │                          │                            │
+  │◄── "document ready" ─────│                            │
+  │                          │                            │
+  │                          │◄──── opens signing link ───│
+  │                   status → viewed                     │
+  │                   appends audit event                 │
+  │◄── "document viewed" ────│                            │
+  │                          │                            │
+  │                          │◄──── submits OTP ──────────│
+  │                   verifies OTP                        │
+  │                   computes signature hash             │
+  │                   status → signed ──── email ─────────►│
+  │◄── "document signed" ────│                            │
+  │                   appends audit event                 │
+  │                   saves signed PDF                    │
+  │                          │                            │
+
+
+                CRON (time-based, independent of user actions)
                           │
-                   calls DocumentService.transition()
-                   and sendDocumentEmail()
-                   — same interfaces as user actions
+            every hour → check expiresAt
+            if passed and not signed:
+                status → expired
+                appends audit event
+                email ──────────────────────────────────► OWNER
+                email ──────────────────────────────────► SIGNER
 ```
 
-### 11.2 Document Lifecycle with Actors
+### 12.3 Sequential Multi-Party Signing
 
 ```
-OWNER                    SYSTEM                    SIGNER
-  │                         │                         │
-  │── fills form ──────────►│                         │
-  │                    creates draft                  │
-  │                         │                         │
-  │── clicks Send ─────────►│                         │
-  │                  generates PDF                    │
-  │                  stores to Drive                  │
-  │                  status → sent ────────email──────►│
-  │                  appends event                    │
-  │                         │                         │
-  │                         │◄──── opens link ────────│
-  │                    status → viewed                │
-  │                    appends event                  │
-  │                         │                         │
-  │◄── viewed notification ─│                         │
-  │                         │                         │
-  │                         │◄──── enters OTP ────────│
-  │                    verifies OTP                   │
-  │                    computes hash                  │
-  │                    status → signed ───email────────►│
-  │◄── signed notification ─│                         │
-  │                    appends event                  │
-  │                    saves final PDF                │
-  │                         │                         │
+Document: NDA between Party A (order:1) and Party B (order:2)
 
-
-                    CRON (independent)
-                         │
-              every hour: check expiresAt
-              if passed and not signed:
-                status → expired ──email──► OWNER
-                         │        ──email──► SIGNER
-                    appends event
-```
-
-### 11.3 Multi-Signer Sequence
-
-```
-  Document created with 3 signers (order: 1, 2, 3)
-
-  ┌──────────────────────────────────────────────────────┐
-  │ Signer A (order:1)    Signer B (order:2)    Signer C (order:3) │
-  │                                                       │
-  │  ◄── notified ──                                      │
-  │       signs                                           │
-  │                                                       │
-  │  [cron: advanceSigningQueue detects A signed]         │
-  │                   ◄── notified ──                     │
-  │                        signs                          │
-  │                                                       │
-  │  [cron: advanceSigningQueue detects B signed]         │
-  │                                       ◄── notified ── │
-  │                                            signs      │
-  │                                                       │
-  │  [all signers done → document.signed event emitted]   │
-  │  [owner notified]                                     │
-  └──────────────────────────────────────────────────────┘
+  SYSTEM                  PARTY A (order:1)         PARTY B (order:2)
+    │                           │                           │
+    │── notifies ───────────────►│                           │
+    │                      signs │                           │
+    │◄── signed ────────────────│                           │
+    │                                                        │
+    │  [cron: advanceSigningQueue]                           │
+    │  all order:1 signers have signed                       │
+    │── notifies ────────────────────────────────────────────►│
+    │                                                   signs │
+    │◄── signed ─────────────────────────────────────────────│
+    │                                                        │
+    │  [all signers complete]                                │
+    │  document.signed event emitted                         │
+    │  owner notified                                        │
+    │  final PDF saved to storage                            │
 ```
 
 ---
 
-## 12. Implementation Roadmap
+## 13. Implementation Roadmap
+
+The roadmap is organized by risk, not by feature. The decisions that are most expensive to change later are scheduled first.
 
 ### Phase 1 — Foundation (Weeks 1–4)
 
-These decisions are expensive to change later. Do them first.
+_Goal: establish the architecture that everything else builds on. No features ship in this phase. The output is a correct foundation, not a working product._
 
-- [ ] Implement the full `Document` schema with lifecycle timestamps
-- [ ] Build `document_events` append-only table with integrity hashing
-- [ ] Implement `DocumentService.transition()` as the single state-change entry point
-- [ ] Set up the event bus (in-process emitter, swappable interface)
-- [ ] Build the email registry with provider abstraction
-- [ ] Set up cron runner with structured logging
+- [ ] Implement full `Document` schema with lifecycle timestamp fields
+- [ ] Create `document_signers` table with sequential signing order
+- [ ] Build `document_events` table with integrity hash chain and database-level write restrictions
+- [ ] Implement `DocumentService.transition()` with row-level locking and atomic writes
+- [ ] Define typed `DocumentEventType` union — no magic strings anywhere
+- [ ] Set up in-process event bus with swappable interface
+- [ ] Build email registry with provider abstraction and send deduplication
+- [ ] Set up cron runner with structured logging, metrics, and alerting
+- [ ] Define all indexes from the initial migration
+- [ ] Write test suite for: valid transitions, invalid transition errors, audit chain integrity
 
-### Phase 2 — Core Workflow (Weeks 5–8)
+### Phase 2 — Core Document Workflow (Weeks 5–8)
 
-- [ ] Implement document generation queue (BullMQ)
-- [ ] Build signing link service (JWT-based, time-limited)
-- [ ] Implement OTP verification service with rate limiting
-- [ ] Build all six email templates
-- [ ] Implement `enforceDocumentExpiry` and `sendSignatureReminders` cron jobs
+_Goal: a document can be generated, sent, and signed end to end._
+
+- [ ] Build document generation queue (BullMQ worker pool)
+- [ ] Implement signing link service (JWT with jti blocklist)
+- [ ] Build OTP verification service (Redis TTL + rate limiting)
+- [ ] Implement all six email templates with preview routes
+- [ ] Build `enforceDocumentExpiry` and `sendSignatureReminders` cron jobs
 - [ ] Expose `/audit-trail` endpoint with chain verification
+- [ ] Implement `saveDocumentToStorage` callback for at least one provider (Drive)
+- [ ] Write integration tests covering the full document lifecycle
 
-### Phase 3 — Storage and Multi-Party (Weeks 9–12)
+### Phase 3 — Multi-Party Signing and Storage (Weeks 9–12)
 
-- [ ] Build storage abstraction layer
-- [ ] Implement Google Drive, Dropbox, Box providers
-- [ ] Build `document_signers` table and multi-party signing flow
+_Goal: sequential multi-party signing works; all three storage providers are connected._
+
 - [ ] Implement `advanceSigningQueue` cron job
-- [ ] Add per-signer reminder tracking
+- [ ] Per-signer reminder tracking and notification emails
+- [ ] Google Drive, Dropbox, and Box storage provider implementations
+- [ ] `sendExpiryWarnings` cron job
+- [ ] Rate limiting at the workspace level
+- [ ] Document revocation flow with signer notification
 
 ### Phase 4 — Scalability and Compliance (Weeks 13–16)
 
-- [ ] Add read replicas for dashboard queries
-- [ ] Implement cursor-based pagination in all cron jobs
-- [ ] Add data retention job (expiry warnings + GDPR anonymization)
-- [ ] Build workspace/team model
-- [ ] Add webhook service (subscribes to event log)
+_Goal: the system handles growth without architectural changes._
+
+- [ ] PostgreSQL read replica for dashboard and analytics queries
+- [ ] Cursor-based pagination in all cron jobs (replace any findMany without cursor)
+- [ ] Data retention job: draft archival and GDPR IP anonymization
+- [ ] Workspace and team model with row-level access enforcement
+- [ ] Webhook service: subscription model over the event log
+- [ ] Load testing: validate generation queue, cron jobs, and audit trail under production-scale data volumes
 
 ---
 
-## 13. What Not to Build
+## 14. What Not to Build
 
-**Do not build a custom state machine library.** The valid transitions map in Section 4.1 is all you need. A state machine library adds an abstraction layer that makes the code harder to read without adding meaningful safety that TypeScript's type system does not already provide.
+These are deliberate constraints. Each represents a common engineering impulse that would add complexity without proportionate value at Doclast's current stage.
 
-**Do not put document generation in the API request path.** The temptation is strong — it is simpler to render and respond in one request. It is also a reliability and latency problem at any meaningful scale.
+**Do not build a custom state machine library.**  
+The valid transitions map in §5.1 is all you need. A state machine library adds an indirection layer that makes the transitions harder to read and debug, without adding safety that TypeScript's type system doesn't already provide.
 
-**Do not use document `status` as the only lifecycle signal.** Many time-aware features — reminders, expiry, analytics, compliance reporting — need the timestamp fields. Building without them means retrofitting later, which is expensive in a live production system.
+**Do not put document generation in the API request path.**  
+The short-term simplicity is real. The long-term cost — latency degradation, timeout risk, inability to scale rendering capacity independently — is larger. The queue adds one day of implementation complexity and eliminates an entire category of production incidents.
 
-**Do not mix the audit log with the application log.** Application logs (errors, performance traces) are operational data. The audit event log is legal evidence. They have different retention policies, different access controls, and different compliance requirements. They are different tables.
+**Do not use `status` as the only lifecycle signal.**  
+Dozens of features — reminder cooldown, expiry enforcement, analytics dashboards, compliance reports — require time-based reasoning. Without the timestamp fields they require reconstructing history from the event log on every request, which is expensive and fragile.
 
-**Do not expose the raw event log to the client.** The audit trail endpoint should return a verified, human-readable representation of events — not raw database rows. The internal event format is an implementation detail.
+**Do not merge the audit log and the application log.**  
+Application logs are operational data for engineers. The audit event log is legal evidence for contracts. They have different access controls, different retention policies, different query patterns, and in some jurisdictions different compliance obligations. They are different tables, managed by different service accounts.
+
+**Do not expose raw database rows through the audit trail API.**  
+The internal schema of `document_events` is an implementation detail. The API response is a product — it should be human-readable, chain-verified, and stable across schema changes. Return a transformed response, not a direct ORM result.
+
+**Do not add signing integrations (DocuSign, HelloSign) in Phase 1.**  
+OTP-based signing is sufficient for the early market. External signing integrations add OAuth complexity, webhook receivers, and third-party dependency risk before you have validated whether customers need it. Design the `signatureMethod` field on the schema to accommodate it later — build the integration only when customers ask for it explicitly.
 
 ---
 
-## Appendix A — Files Reviewed from SidebarVulcan
+## 15. Appendix
 
-| File                                                 | Key finding                                                                                   |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `packages/sidebar2020/lib/modules/posts/schema.js`   | Lifecycle timestamps as first-class schema fields alongside status                            |
-| `packages/sidebar2020/lib/server/posts/callbacks.js` | Named composable callbacks per mutation; magic context strings are the anti-pattern to avoid  |
-| `packages/sidebar2020/lib/server/emails/emails.js`   | Self-contained declarative email objects — the most directly portable pattern in the codebase |
-| `packages/sidebar2020/lib/server/cron.js`            | Isolated scheduled job registry; clean separation from mutation and callback layers           |
-| `README.md`                                          | Architecture overview: Vulcan.js on Meteor, GraphQL, MongoDB                                  |
+### Appendix A — SidebarVulcan Files Reviewed
 
-## Appendix B — Technology Recommendations
+| File                            | Key Finding                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `lib/modules/posts/schema.js`   | Lifecycle timestamps as first-class schema fields; `status` and timestamps are complementary, not redundant         |
+| `lib/server/posts/callbacks.js` | Composable named callbacks per mutation; the anti-pattern to avoid is implicit context branching with magic strings |
+| `lib/server/emails/emails.js`   | Declarative self-contained email objects — the most directly portable pattern in the codebase                       |
+| `lib/server/cron.js`            | Isolated scheduled job registry with clean separation from the mutation layer                                       |
+| `README.md`                     | System overview: Vulcan.js on Meteor, GraphQL data layer, MongoDB                                                   |
 
-These are recommendations, not requirements. The architecture above is framework-agnostic.
+### Appendix B — Technology Recommendations
 
-| Layer         | Recommendation          | Rationale                                                                |
-| ------------- | ----------------------- | ------------------------------------------------------------------------ |
-| Runtime       | Node.js + TypeScript    | Typed event constants, enforced at compile time                          |
-| Database      | PostgreSQL              | Row-level locking, ACID transactions, strong indexing                    |
-| ORM           | Prisma or Drizzle       | Type-safe queries, migration tooling                                     |
-| Queue         | BullMQ (Redis)          | Production-grade, observable, retries built in                           |
-| Email         | Resend                  | Modern API, good deliverability, template support                        |
-| Cron          | node-cron or Inngest    | node-cron for simplicity; Inngest if you want observability from day one |
-| Signing links | JWT (jsonwebtoken)      | Self-verifying, no DB lookup required                                    |
-| Hashing       | Node.js `crypto` module | No dependency, SHA-256 is sufficient                                     |
+The architecture described in this report is framework-agnostic. These are recommendations based on production suitability at Doclast's stage.
+
+| Layer          | Recommendation            | Rationale                                                                          |
+| -------------- | ------------------------- | ---------------------------------------------------------------------------------- |
+| Language       | TypeScript (strict mode)  | Typed event unions catch whole classes of lifecycle bugs at compile time           |
+| Database       | PostgreSQL                | ACID transactions, row-level locking, partial indexes, strong ecosystem            |
+| ORM            | Prisma or Drizzle         | Type-safe queries, migration tooling, good TypeScript integration                  |
+| Job queue      | BullMQ on Redis           | Production-grade, observable, configurable retry and priority                      |
+| Email provider | Resend                    | Modern REST API, template support, good deliverability                             |
+| Cron scheduler | Inngest or node-cron      | Inngest provides out-of-the-box observability; node-cron if you prefer self-hosted |
+| Signing links  | JWT (`jsonwebtoken`)      | Self-verifying tokens require no database lookup; built-in expiry                  |
+| OTP storage    | Redis with TTL            | Fast, automatic expiry, no DB polling                                              |
+| Hashing        | Node.js `crypto` built-in | No external dependency; SHA-256 is sufficient for all use cases                    |
+| Logging        | Pino (structured JSON)    | Machine-readable, low overhead, works well with all log aggregation platforms      |
+
+### Appendix C — Glossary
+
+| Term                    | Definition in This Document                                                                              |
+| ----------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Terminal state**      | A status (`signed`, `expired`, `revoked`) from which no further transitions are permitted                |
+| **Lifecycle timestamp** | A nullable `Date` field on the document record that captures when a specific status was first reached    |
+| **Transition function** | `DocumentService.transition()` — the single authorized path for changing document status                 |
+| **Integrity hash**      | A SHA-256 hash chained from the previous event, stored on each audit event row                           |
+| **Signing order**       | An integer on `document_signers` that controls which signers are notified first in multi-party workflows |
+| **CRON_ACTOR**          | A constant `EventActor` object used when a cron job is the actor in a transition call                    |
+| **Dead letter queue**   | A secondary queue where failed jobs are deposited for investigation and manual retry                     |
+| **Cursor pagination**   | A query technique that fetches batches using the last record's ID as a cursor, avoiding full table scans |
